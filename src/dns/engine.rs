@@ -13,7 +13,7 @@ use crate::dns::packet;
 use crate::dns::types::RecordType;
 use crate::edns::EdnsHandler;
 use crate::negative::NegativeCache;
-use crate::neko_comment::NekoComment;
+use crate::neko_comment::{NekoComment, QueryFeatures};
 use crate::recursive::RecursiveResolver;
 use crate::journey::JourneyTracker;
 use crate::curiosity::CuriosityCache;
@@ -81,6 +81,7 @@ impl QueryEngine {
     /// Handle a raw DNS query and return raw response bytes
     pub async fn handle_query(&self, query_data: &[u8]) -> anyhow::Result<Vec<u8>> {
         let start = std::time::Instant::now();
+        let mut features = QueryFeatures::new();
 
         // Parse the incoming query
         let (qname, qtype) = packet::extract_query_info(query_data)?;
@@ -89,30 +90,41 @@ impl QueryEngine {
         // Check chaos mode - maybe inject a failure
         if self.chaos.should_fail(&qname) {
             info!("🎲 Chaos mode: injecting SERVFAIL for {}", qname);
+            features.chaos_triggered = true;
             self.journal.record_query(&qname, &qtype, "CHAOS_SERVFAIL", 0, start.elapsed()).await;
-            return packet::build_servfail(query_data);
+            let mut response = packet::build_servfail(query_data)?;
+            features.latency_ms = Some(start.elapsed().as_millis() as u64);
+            packet::append_feature_record(&mut response, &self.neko_comment, &features);
+            return Ok(response);
         }
 
         // Check EDNS custom options in query
         let edns_meta = self.edns.extract_options(query_data);
         if let Some(ref meta) = edns_meta {
             debug!("EDNS custom metadata: {:?}", meta);
+            features.edns_detected = true;
         }
 
         // Check negative cache
         if let Some(neg_response) = self.negative.check(&qname, &qtype) {
             debug!("Negative cache hit: {} {}", qname, qtype.name());
-            let response = packet::build_servfail(query_data)?; // NXDOMAIN from cached
+            features.negative_cache_hit = true;
+            features.latency_ms = Some(start.elapsed().as_millis() as u64);
+            let mut response = neg_response;
+            packet::append_feature_record(&mut response, &self.neko_comment, &features);
             self.journal.record_query(&qname, &qtype, "NEGATIVE_CACHE_HIT", 0, start.elapsed()).await;
-            return Ok(neg_response);
+            return Ok(response);
         }
 
         // Check cache
         if let Some(cached) = self.cache.get(&qname, &qtype).await {
             debug!("Cache hit: {} {} (remaining TTL: {}s)", qname, qtype.name(), cached.remaining_ttl);
+            features.cache_hit = true;
+            features.ttl_alchemy = true;
+            features.latency_ms = Some(start.elapsed().as_millis() as u64);
             let mut response = packet::build_response(query_data, &cached.raw_response, cached.remaining_ttl)?;
-            // 🐱 ネコのひとこと注入
-            packet::append_additional_record(&mut response, &self.neko_comment);
+            // 🐱 Feature notification
+            packet::append_feature_record(&mut response, &self.neko_comment, &features);
             self.journal.record_query(&qname, &qtype, &cached.upstream_name, cached.remaining_ttl, start.elapsed()).await;
 
             // Record hit for prefetch/TTL alchemy
@@ -123,10 +135,13 @@ impl QueryEngine {
 
         // Cache miss - try recursive resolution first, then fall back to upstream forwarding
         debug!("Cache miss: {} {} - resolving", qname, qtype.name());
+        features.cache_miss = true;
 
         let (result_response, result_upstream_name, result_latency, result_original_ttl) = 
             if let Some(ref recursive) = self.recursive {
                 // 🌲 再帰解決モード
+                features.recursive = true;
+                features.parallel_dfs = true;
                 let start_resolve = std::time::Instant::now();
                 match recursive.resolve(&qname, qtype, &self.curiosity, &self.journey).await {
                     Ok(mut response) => {
@@ -142,18 +157,24 @@ impl QueryEngine {
                             // RA=1 (Recursion Available) を設定
                             response[3] |= 0x80;
                         }
+                        features.journey_recorded = true;
                         (response, "recursive".to_string(), latency, ttl)
                     }
                     Err(e) => {
                         warn!("🌲 Recursive resolution failed for {} {}: {}, falling back to upstream", qname, qtype.name(), e);
                         // フォールバック: upstream forwarding
+                        features.recursive = false;
+                        features.upstream_forward = true;
                         let result = self.upstream.race_query(query_data).await?;
+                        features.upstream_winner = Some(result.upstream_name.clone());
                         (result.response, result.upstream_name, result.latency, result.original_ttl)
                     }
                 }
             } else {
                 // 📡 フォワーディングモード
+                features.upstream_forward = true;
                 let result = self.upstream.race_query(query_data).await?;
+                features.upstream_winner = Some(result.upstream_name.clone());
                 (result.response, result.upstream_name, result.latency, result.original_ttl)
             };
 
@@ -193,11 +214,12 @@ impl QueryEngine {
             result_latency
         );
 
-        // 🐱 ネコのひとこと注入
+        // 🐱 Feature notification (ASCII-only, shows triggered features)
         let mut response = result_response;
-        packet::append_additional_record(&mut response, &self.neko_comment);
+        features.latency_ms = Some(start.elapsed().as_millis() as u64);
+        packet::append_feature_record(&mut response, &self.neko_comment, &features);
 
-        // 🗺️ 解決の旅路 TXT 追加 (再帰解決時のみ)
+        // 🗺️ Resolution Journey TXT (recursive mode only)
         if self.recursive.is_some() {
             if let Some(journey_txt) = self.journey.build_journey_txt(&qname) {
                 let arcount = u16::from_be_bytes([response[10], response[11]]);
@@ -266,7 +288,7 @@ impl QueryEngine {
 
             for (name, qtype) in candidates {
                 debug!("Prefetching: {} {}", name, qtype.name());
-                let query = packet::build_query(rand::random(), &name, qtype, true);
+                let query = packet::build_query({ use rand::rngs::OsRng; use rand::Rng; OsRng.gen() }, &name, qtype, true);
                 if let Ok(result) = self.upstream.race_query(&query).await {
                     self.cache.insert(&name, &qtype, &result.response, &result.upstream_name).await;
                 }
@@ -327,7 +349,7 @@ impl QueryEngine {
             while let Some(target) = self.curiosity.pop_walk_target() {
                 if self.cache.get(&target, &RecordType::A).await.is_none() {
                     debug!("🐱 Curiosity walk: resolving {}", target);
-                    let query = packet::build_query(rand::random(), &target, RecordType::A, true);
+                    let query = packet::build_query({ use rand::rngs::OsRng; use rand::Rng; OsRng.gen() }, &target, RecordType::A, true);
                     let _ = self.handle_query(&query).await;
                 }
             }

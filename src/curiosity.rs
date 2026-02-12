@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::Rng;
+use rand::rngs::OsRng;
 use tracing::{debug, info, trace};
 
 /// 🐱 好奇心キャッシュ (Curiosity Cache)
@@ -131,9 +132,8 @@ impl CuriosityCache {
     pub async fn random_walk(&self, current_zone: &str) {
         // よくあるサブドメインプレフィックスで散歩
         let prefixes = ["www", "mail", "ns1", "ns2", "mx", "api"];
-        let mut rng = rand::thread_rng();
 
-        let prefix = prefixes[rng.gen_range(0..prefixes.len())];
+        let prefix = prefixes[OsRng.gen_range(0..prefixes.len())];
         let walk_target = format!("{}.{}", prefix, current_zone);
 
         debug!("🐱 Curiosity walk: wandering to {}", walk_target);

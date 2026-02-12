@@ -1,93 +1,118 @@
-use rand::Rng;
 use crate::config::NekoCommentConfig;
 
-/// 🐱 neko-dns の隠し味 - ADDITIONALセクションにネコのひとことを仕込む
+/// 🐱 neko-dns feature notifier
+/// Adds an ADDITIONAL TXT record showing which resolver features
+/// were triggered during query processing.
+/// All messages are pure ASCII to avoid encoding issues in dig/drill output.
+
 pub struct NekoComment {
     enabled: bool,
-    messages: Vec<&'static str>,
 }
 
-const NEKO_MESSAGES: &[&str] = &[
-    // 日本語ネコ語
-    "にゃー。DNSってうまいの？",
-    "キャッシュヒットにゃ！ (ΦωΦ)",
-    "このクエリ、さっきも見たにゃ",
-    "上流に聞いてきたにゃー",
-    "ゴロゴロ... DNS解決完了にゃ",
-    "お魚くわえたドメイン名にゃ",
-    "毛づくろい中... あ、レスポンス返すにゃ",
-    "にゃんでそんなドメイン聞くにゃ？",
-    "TTL錬金術でちょっと長持ちにゃ",
-    "夜行性なので深夜のクエリ大歓迎にゃ",
-    // 英語ネコ
-    "meow. resolving your queries since 2026",
-    "purrfect cache hit! =^.^=",
-    "i can haz DNS resolution?",
-    "404 cat not found... just kidding, here's your answer",
-    "this response was paw-cessed by neko-dns",
-    "DNS is just cats all the way down",
-    "trust me, this upstream is purr-liable",
-    "cached with love by a digital cat",
-    // ネコ雑学
-    "fun fact: cats sleep 16 hours, neko-dns sleeps 0",
-    "neko-dns has 9 lives... err, 4 upstreams",
-    "the internet was made for cats. and DNS.",
-    // アスキーアート的な
-    "/\\_/\\ meow~",
-    "(=^-^=) resolved!",
-    "~(=^..^) nyan~",
-    ">{^_^}< query complete!",
-    // 季節もの・時間帯
-    "深夜のDNS職人、ここにいるにゃ",
-    "もう寝たら？...にゃんて",
-];
+/// Tracks which features were triggered during a single query processing
+#[derive(Debug, Clone, Default)]
+pub struct QueryFeatures {
+    pub cache_hit: bool,
+    pub cache_miss: bool,
+    pub ttl_alchemy: bool,
+    pub recursive: bool,
+    pub upstream_forward: bool,
+    pub negative_cache_hit: bool,
+    pub serve_stale: bool,
+    pub prefetch_candidate: bool,
+    pub curiosity_glue_hit: bool,
+    pub journey_recorded: bool,
+    pub parallel_dfs: bool,
+    pub edns_detected: bool,
+    pub chaos_triggered: bool,
+    /// Which upstream won the race (if forwarding mode)
+    pub upstream_winner: Option<String>,
+    /// Resolution latency in ms
+    pub latency_ms: Option<u64>,
+}
+
+impl QueryFeatures {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a compact ASCII summary of triggered features
+    pub fn to_summary(&self) -> String {
+        let mut tags: Vec<&str> = Vec::new();
+
+        if self.cache_hit      { tags.push("CACHE_HIT"); }
+        if self.cache_miss     { tags.push("CACHE_MISS"); }
+        if self.recursive      { tags.push("RECURSIVE"); }
+        if self.parallel_dfs   { tags.push("DFS_PARALLEL"); }
+        if self.upstream_forward { tags.push("FORWARDED"); }
+        if self.negative_cache_hit { tags.push("NEG_CACHE"); }
+        if self.serve_stale    { tags.push("SERVE_STALE"); }
+        if self.ttl_alchemy    { tags.push("TTL_ALCHEMY"); }
+        if self.curiosity_glue_hit { tags.push("CURIOSITY_GLUE"); }
+        if self.journey_recorded { tags.push("JOURNEY"); }
+        if self.edns_detected  { tags.push("EDNS"); }
+        if self.chaos_triggered { tags.push("CHAOS"); }
+
+        let features = tags.join("|");
+        let mut parts = vec![format!("neko-dns [{}]", features)];
+
+        if let Some(ref name) = self.upstream_winner {
+            parts.push(format!("via:{}", name));
+        }
+        if let Some(ms) = self.latency_ms {
+            parts.push(format!("{}ms", ms));
+        }
+
+        parts.join(" ")
+    }
+}
 
 impl NekoComment {
     pub fn new(config: &NekoCommentConfig) -> Self {
         Self {
             enabled: config.enabled,
-            messages: NEKO_MESSAGES.to_vec(),
         }
     }
 
-    /// ランダムなひとことを取得
-    pub fn get_comment(&self) -> Option<&str> {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Build an ADDITIONAL TXT record from triggered query features.
+    /// name: "neko-dns.features." TXT record, class CH, TTL 0
+    /// All content is pure ASCII - no encoding issues with any DNS client.
+    pub fn build_feature_txt(&self, features: &QueryFeatures) -> Option<Vec<u8>> {
         if !self.enabled {
             return None;
         }
-        let mut rng = rand::thread_rng();
-        Some(self.messages[rng.gen_range(0..self.messages.len())])
-    }
 
-    /// ADDITIONALセクション用のTXTレコードバイナリを生成
-    /// name: "neko-dns.comment." の TXT レコード
-    pub fn build_additional_txt(&self) -> Option<Vec<u8>> {
-        let comment = self.get_comment()?;
+        let summary = features.to_summary();
+        let summary_bytes = summary.as_bytes();
+
+        // Sanity: TXT RDATA must fit reasonably in a DNS packet
+        if summary_bytes.len() > 500 {
+            return None;
+        }
+
         let mut record = Vec::new();
 
-        // Name: "neko-dns.comment." encoded
-        // neko-dns = 8 bytes label
-        // comment  = 7 bytes label
+        // Name: "neko-dns.features." encoded as DNS labels
         record.push(8);
         record.extend_from_slice(b"neko-dns");
-        record.push(7);
-        record.extend_from_slice(b"comment");
-        record.push(0); // root
+        record.push(8);
+        record.extend_from_slice(b"features");
+        record.push(0); // root label
 
         // Type: TXT (16)
         record.extend_from_slice(&16u16.to_be_bytes());
-        // Class: CH (Chaosnet, class 3) - 慣例的にメタ情報はCHクラス
-        record.extend_from_slice(&3u16.to_be_bytes());
-        // TTL: 0 (キャッシュしない)
+        // Class: IN (1) - use IN class for maximum client compatibility
+        record.extend_from_slice(&1u16.to_be_bytes());
+        // TTL: 0 (do not cache)
         record.extend_from_slice(&0u32.to_be_bytes());
 
-        // RDATA: TXT format = length-prefixed strings
-        let comment_bytes = comment.as_bytes();
-        // TXTは255バイト以下の文字列を複数格納できる
-        // 1つの文字列として格納
+        // RDATA: TXT format = length-prefixed character-strings (max 255 each)
         let mut rdata = Vec::new();
-        // 長い場合は分割
-        for chunk in comment_bytes.chunks(255) {
+        for chunk in summary_bytes.chunks(255) {
             rdata.push(chunk.len() as u8);
             rdata.extend_from_slice(chunk);
         }

@@ -38,9 +38,12 @@ impl ChaosEngine {
             }
         }
 
-        // Roll the dice
-        let mut rng = rand::thread_rng();
-        let roll: f64 = rng.gen();
+        // Roll the dice (CSPRNG - not predictable from system state)
+        let roll: f64 = {
+            use rand::rngs::OsRng;
+            use rand::Rng;
+            OsRng.gen()
+        };
         if roll < self.config.servfail_probability {
             self.injected_count.fetch_add(1, Ordering::Relaxed);
             true

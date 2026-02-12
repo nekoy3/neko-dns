@@ -1,5 +1,5 @@
 use crate::dns::types::{RecordType, DnsClass, ResponseCode};
-use crate::neko_comment::NekoComment;
+use crate::neko_comment::{NekoComment, QueryFeatures};
 use std::fmt;
 
 /// Raw DNS packet parser - full binary level parsing per RFC 1035
@@ -416,13 +416,14 @@ pub fn parse_name_at_offset(full_packet: &[u8], offset: usize) -> anyhow::Result
     parse_name(full_packet, &mut pos)
 }
 
-/// Append a neko-dns comment as an ADDITIONAL TXT record to a response
-/// Modifies the packet in-place: appends the record bytes and increments ARCOUNT
-pub fn append_additional_record(response: &mut Vec<u8>, neko: &NekoComment) {
+/// Append a neko-dns feature notification TXT record to a response.
+/// Shows which resolver features were triggered during query processing.
+/// Modifies the packet in-place: appends the record bytes and increments ARCOUNT.
+pub fn append_feature_record(response: &mut Vec<u8>, neko: &NekoComment, features: &QueryFeatures) {
     if response.len() < 12 {
         return;
     }
-    if let Some(txt_record) = neko.build_additional_txt() {
+    if let Some(txt_record) = neko.build_feature_txt(features) {
         // Increment ARCOUNT (bytes 10-11)
         let arcount = u16::from_be_bytes([response[10], response[11]]);
         let new_arcount = arcount.wrapping_add(1);

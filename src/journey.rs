@@ -143,8 +143,8 @@ impl JourneyTracker {
 
         // Type: TXT (16)
         record.extend_from_slice(&16u16.to_be_bytes());
-        // Class: CH (3)
-        record.extend_from_slice(&3u16.to_be_bytes());
+        // Class: IN (1) - use IN class for maximum client compatibility
+        record.extend_from_slice(&1u16.to_be_bytes());
         // TTL: 0
         record.extend_from_slice(&0u32.to_be_bytes());
 

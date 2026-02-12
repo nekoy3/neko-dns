@@ -121,7 +121,11 @@ impl RecursiveResolver {
         journey: &JourneyTracker,
     ) -> anyhow::Result<Vec<u8>> {
         let start = Instant::now();
-        let query_id: u16 = rand::random();
+        let query_id: u16 = {
+            use rand::rngs::OsRng;
+            use rand::Rng;
+            OsRng.gen()
+        };
 
         info!("🌲 Recursive resolve: {} {} (DFS mode)", qname, qtype.name());
 
@@ -135,10 +139,10 @@ impl RecursiveResolver {
             .filter_map(|s| s.ipv4.map(|ip| SocketAddr::new(IpAddr::V4(ip), 53)))
             .collect();
 
-        // ルートサーバーをシャッフル (負荷分散)
+        // ルートサーバーをシャッフル (負荷分散, CSPRNG)
         {
-            let mut rng = rand::thread_rng();
-            current_servers.shuffle(&mut rng);
+            use rand::rngs::OsRng;
+            current_servers.shuffle(&mut OsRng);
         }
 
         journey.add_step(qname, ".", "ROOT", &format!("{} root servers", current_servers.len()));
@@ -311,16 +315,16 @@ impl RecursiveResolver {
                         break;
                     }
 
-                    // シャッフルして次のラウンドへ
+                    // シャッフルして次のラウンドへ (CSPRNG)
                     {
-                        let mut rng = rand::thread_rng();
-                        next_servers.shuffle(&mut rng);
+                        use rand::rngs::OsRng;
+                        next_servers.shuffle(&mut OsRng);
                     }
                     current_servers = next_servers;
                     depth += 1;
 
                     // 🐱 好奇心散歩: たまに関連ドメインを先回り解決
-                    if self.config.curiosity_walk && rand::random::<f64>() < 0.15 {
+                    if self.config.curiosity_walk && { use rand::rngs::OsRng; use rand::Rng; OsRng.gen::<f64>() } < 0.15 {
                         let walk_zone = zone.clone();
                         let curiosity_clone = curiosity.clone();
                         tokio::spawn(async move {
@@ -402,17 +406,33 @@ impl RecursiveResolver {
         results
     }
 
-    /// 1つのNSサーバーにクエリ送信 (RD=0: 再帰不要)
+    /// Send a single DNS query to an NS server (RD=0: no recursion desired).
+    /// Uses CSPRNG (OsRng) for both transaction ID and source port
+    /// to mitigate DNS cache poisoning (RFC 5452).
     async fn send_query(
         qname: &str,
         qtype: RecordType,
         addr: SocketAddr,
         timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
-        let query_id: u16 = rand::random();
+        use rand::rngs::OsRng;
+        use rand::Rng;
+
+        // CSPRNG transaction ID (unpredictable, not based on system clock/pid)
+        let query_id: u16 = OsRng.gen();
         let query = packet::build_query(query_id, qname, qtype, false); // RD=0
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        // CSPRNG source port selection in ephemeral range (RFC 5452)
+        let src_port: u16 = OsRng.gen_range(49152..=65535);
+        let bind_addr: SocketAddr = format!("0.0.0.0:{}", src_port)
+            .parse()
+            .unwrap();
+
+        let socket = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => UdpSocket::bind("0.0.0.0:0").await?,
+        };
+
         socket.send_to(&query, addr).await?;
 
         let mut buf = vec![0u8; 4096];

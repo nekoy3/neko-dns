@@ -126,9 +126,25 @@ impl UpstreamManager {
         }
     }
 
-    /// Send query to a single upstream and wait for response
+    /// Send query to a single upstream and wait for response.
+    /// Uses explicit source port randomization (ephemeral range 49152-65535)
+    /// with CSPRNG (OsRng) to mitigate DNS cache poisoning attacks (RFC 5452).
     async fn query_upstream(query: &[u8], addr: SocketAddr, timeout: Duration) -> anyhow::Result<Vec<u8>> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        use rand::rngs::OsRng;
+        use rand::Rng;
+
+        // CSPRNG source port selection in ephemeral range
+        let src_port: u16 = OsRng.gen_range(49152..=65535);
+        let bind_addr: SocketAddr = format!("0.0.0.0:{}", src_port)
+            .parse()
+            .unwrap();
+
+        // Retry with different port on bind failure (port collision)
+        let socket = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => s,
+            Err(_) => UdpSocket::bind("0.0.0.0:0").await?,
+        };
+
         socket.send_to(query, addr).await?;
 
         let mut buf = vec![0u8; 4096];
