@@ -14,6 +14,9 @@ use crate::dns::types::RecordType;
 use crate::edns::EdnsHandler;
 use crate::negative::NegativeCache;
 use crate::neko_comment::NekoComment;
+use crate::recursive::RecursiveResolver;
+use crate::journey::JourneyTracker;
+use crate::curiosity::CuriosityCache;
 
 /// Core query engine - handles all DNS query processing
 pub struct QueryEngine {
@@ -25,6 +28,9 @@ pub struct QueryEngine {
     pub edns: Arc<EdnsHandler>,
     pub negative: Arc<NegativeCache>,
     pub neko_comment: Arc<NekoComment>,
+    pub recursive: Option<Arc<RecursiveResolver>>,
+    pub journey: Arc<JourneyTracker>,
+    pub curiosity: Arc<CuriosityCache>,
 }
 
 impl QueryEngine {
@@ -37,6 +43,26 @@ impl QueryEngine {
         let negative = Arc::new(NegativeCache::new(&config.negative));
         let neko_comment = Arc::new(NekoComment::new(&config.neko_comment));
 
+        // 再帰解決エンジン (有効な場合のみ初期化)
+        let recursive = if config.recursive.enabled {
+            match RecursiveResolver::new(&config.recursive) {
+                Ok(r) => {
+                    info!("🌲 Recursive resolution enabled (parallel DFS, {} branches)", config.recursive.parallel_branches);
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    warn!("🌲 Failed to init recursive resolver: {} (falling back to forwarding)", e);
+                    None
+                }
+            }
+        } else {
+            info!("📡 Forwarding mode (recursive resolution disabled)");
+            None
+        };
+
+        let journey = Arc::new(JourneyTracker::new(config.recursive.journey_txt));
+        let curiosity = Arc::new(CuriosityCache::new(config.recursive.glue_ttl_secs));
+
         Ok(Self {
             config,
             cache,
@@ -46,6 +72,9 @@ impl QueryEngine {
             edns,
             negative,
             neko_comment,
+            recursive,
+            journey,
+            curiosity,
         })
     }
 
@@ -92,47 +121,94 @@ impl QueryEngine {
             return Ok(response);
         }
 
-        // Cache miss - race upstreams
-        debug!("Cache miss: {} {} - racing upstreams", qname, qtype.name());
-        let result = self.upstream.race_query(query_data).await?;
+        // Cache miss - try recursive resolution first, then fall back to upstream forwarding
+        debug!("Cache miss: {} {} - resolving", qname, qtype.name());
+
+        let (result_response, result_upstream_name, result_latency, result_original_ttl) = 
+            if let Some(ref recursive) = self.recursive {
+                // 🌲 再帰解決モード
+                let start_resolve = std::time::Instant::now();
+                match recursive.resolve(&qname, qtype, &self.curiosity, &self.journey).await {
+                    Ok(mut response) => {
+                        let latency = start_resolve.elapsed();
+                        let ttl = packet::parse_packet(&response)
+                            .ok()
+                            .and_then(|p| p.answers.first().map(|a| a.ttl))
+                            .unwrap_or(0);
+                        // 元クエリのトランザクションIDをコピー
+                        if response.len() >= 12 && query_data.len() >= 2 {
+                            response[0] = query_data[0];
+                            response[1] = query_data[1];
+                            // RA=1 (Recursion Available) を設定
+                            response[3] |= 0x80;
+                        }
+                        (response, "recursive".to_string(), latency, ttl)
+                    }
+                    Err(e) => {
+                        warn!("🌲 Recursive resolution failed for {} {}: {}, falling back to upstream", qname, qtype.name(), e);
+                        // フォールバック: upstream forwarding
+                        let result = self.upstream.race_query(query_data).await?;
+                        (result.response, result.upstream_name, result.latency, result.original_ttl)
+                    }
+                }
+            } else {
+                // 📡 フォワーディングモード
+                let result = self.upstream.race_query(query_data).await?;
+                (result.response, result.upstream_name, result.latency, result.original_ttl)
+            };
 
         // Parse response for caching
-        let response_packet = packet::parse_packet(&result.response)?;
+        let response_packet = packet::parse_packet(&result_response)?;
 
         // Check if NXDOMAIN - add to negative cache
         if response_packet.header.rcode == crate::dns::types::ResponseCode::NxDomain {
-            self.negative.insert(&qname, &qtype, &result.response);
+            self.negative.insert(&qname, &qtype, &result_response);
             debug!("Cached negative response for {} {}", qname, qtype.name());
         }
 
         // Cache the response (TTL alchemy will be applied internally)
         if response_packet.header.rcode == crate::dns::types::ResponseCode::NoError {
-            self.cache.insert(&qname, &qtype, &result.response, &result.upstream_name).await;
+            self.cache.insert(&qname, &qtype, &result_response, &result_upstream_name).await;
         }
 
         // Record in journal
         self.journal.record_query(
             &qname,
             &qtype,
-            &result.upstream_name,
-            result.original_ttl,
+            &result_upstream_name,
+            result_original_ttl,
             start.elapsed(),
         ).await;
 
-        // Update upstream latency for trust scoring
-        self.upstream.record_latency(&result.upstream_name, result.latency).await;
+        // Update upstream latency for trust scoring (forwarding mode only)
+        if result_upstream_name != "recursive" {
+            self.upstream.record_latency(&result_upstream_name, result_latency).await;
+        }
 
         info!(
-            "{} {} -> {} (upstream: {}, latency: {:?})",
+            "{} {} -> {} (via: {}, latency: {:?})",
             qname, qtype.name(), 
             if response_packet.header.ancount > 0 { "OK" } else { "EMPTY" },
-            result.upstream_name,
-            result.latency
+            result_upstream_name,
+            result_latency
         );
 
         // 🐱 ネコのひとこと注入
-        let mut response = result.response;
+        let mut response = result_response;
         packet::append_additional_record(&mut response, &self.neko_comment);
+
+        // 🗺️ 解決の旅路 TXT 追加 (再帰解決時のみ)
+        if self.recursive.is_some() {
+            if let Some(journey_txt) = self.journey.build_journey_txt(&qname) {
+                let arcount = u16::from_be_bytes([response[10], response[11]]);
+                let new_arcount = arcount.wrapping_add(1);
+                let ar_bytes = new_arcount.to_be_bytes();
+                response[10] = ar_bytes[0];
+                response[11] = ar_bytes[1];
+                response.extend_from_slice(&journey_txt);
+            }
+        }
+
         Ok(response)
     }
 
@@ -215,12 +291,54 @@ impl QueryEngine {
 
     /// Get stats for Web UI
     pub fn get_stats(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut stats = serde_json::json!({
             "cache": self.cache.get_stats(),
             "upstreams": self.upstream.get_stats(),
             "journal": self.journal.get_stats(),
             "chaos": self.chaos.get_stats(),
             "negative_cache": self.negative.get_stats(),
-        })
+            "journey": self.journey.get_stats(),
+            "curiosity": self.curiosity.get_stats(),
+        });
+
+        if let Some(ref recursive) = self.recursive {
+            stats["recursive"] = recursive.get_stats();
+            stats["mode"] = serde_json::json!("recursive");
+        } else {
+            stats["mode"] = serde_json::json!("forwarding");
+        }
+
+        stats
+    }
+
+    /// 好奇心散歩ループ - バックグラウンドで散歩キューを処理
+    pub async fn run_curiosity_walk_loop(&self) {
+        if !self.config.recursive.enabled || !self.config.recursive.curiosity_walk {
+            return;
+        }
+
+        info!("🐱 Curiosity walk loop started");
+        let interval = std::time::Duration::from_secs(5);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            // 散歩キューからターゲットを取得して解決
+            while let Some(target) = self.curiosity.pop_walk_target() {
+                if self.cache.get(&target, &RecordType::A).await.is_none() {
+                    debug!("🐱 Curiosity walk: resolving {}", target);
+                    let query = packet::build_query(rand::random(), &target, RecordType::A, true);
+                    let _ = self.handle_query(&query).await;
+                }
+            }
+
+            // 定期クリーンアップ
+            self.curiosity.cleanup();
+        }
+    }
+
+    /// ジャーニー履歴取得 (API用)
+    pub fn get_journey_history(&self, limit: usize) -> Vec<serde_json::Value> {
+        self.journey.get_history(limit)
     }
 }

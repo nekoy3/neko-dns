@@ -30,6 +30,16 @@ neko-dns は RFC 1035 準拠の DNS キャッシュサーバーを基盤に、�
 | 11 | **ネガティブキャッシュ増強** | NXDOMAIN をキャッシュ + typo 亜種も推測ネガキャッシュ (speculative mode) | テストスクリプトで確認 |
 | 12 | **カスタム EDNS 拡張** | EDNS0 OPT に独自オプションコードを追加可能 | dig +ednsopt でテスト |
 | 13 | **DNS ウェザーマップ (Web UI)** | リアルタイムダッシュボード。キャッシュ/upstream/journal を可視化 | ブラウザでアクセス |
+| 14 | **ネコのひとこと (neko_comment)** | ADDITIONALセクションにランダムな猫メッセージをTXTレコードで添える | digでADDITIONALセクション確認 |
+
+### 🌲 再帰解決 + 変な機能 v2
+
+| # | 機能名 | 説明 | 確認方法 |
+|---|--------|------|----------|
+| 15 | **再帰解決 (root hints)** | IANAルートヒントからの反復解決。upstream転送と切り替え可能 | `dig @<server-ip> google.com` で再帰解決 |
+| 16 | **🌲 パラレルDFS探索** | 再帰解決時に複数のNSパスをDFS的に同時探索。レイテンシ・信頼度でスコアリングして最良パスを採用 | API `/api/stats` の recursive セクション |
+| 17 | **🗺️ 解決の旅路 (Journey)** | 再帰解決の全ステップ (root→TLD→auth) をADDITIONAL TXTに記録して返す | digで `neko-dns.journey.` TXT確認 / API `/api/journey` |
+| 18 | **🐱 好奇心キャッシュ (Curiosity)** | 解決中のglueレコードを日和見キャッシュ + たまに関連ドメインを「散歩」して先回り解決 | API `/api/journey` の curiosity セクション |
 
 ## アーキテクチャ
 
@@ -41,12 +51,17 @@ Client → [UDP/TCP :53] → QueryEngine
                               ├─ NegativeCache (NXDOMAIN チェック)
                               ├─ CacheLayer (キャッシュ検索 / TTL錬金術)
                               │      └─ TtlAlchemy (TTL再計算)
-                              ├─ UpstreamManager (マルチアップストリーム競争)
+                              ├─ RecursiveResolver 🌲 (ルートからの反復解決)
+                              │      ├─ ParallelDFS (複数NS同時探索)
+                              │      ├─ JourneyTracker 🗺️ (解決パス記録)
+                              │      └─ CuriosityCache 🐱 (日和見glueキャッシュ+散歩)
+                              ├─ UpstreamManager (マルチアップストリーム競争 / フォールバック)
                               │      └─ TrustScorer (信頼スコア)
                               ├─ Journal (クエリ記録)
+                              ├─ NekoComment 🐱 (ネコのひとこと)
                               └─ PrefetchPredictor (先回りリフレッシュ)
 
-Web UI → [HTTP :8053] → /api/stats, /api/cache, /api/journal, /api/upstreams
+Web UI → [HTTP :8053] → /api/stats, /api/cache, /api/journal, /api/upstreams, /api/journey
 ```
 
 ## 設定ファイル (neko-dns.toml)
@@ -81,6 +96,23 @@ port = 8053
 ```
 
 全設定項目は `neko-dns.toml` を参照。
+
+## 解決モード
+
+neko-dns は2つのモードで動作:
+
+- **再帰解決モード** (`recursive.enabled = true`): ルートヒントから自力で反復解決。パラレルDFS探索、好奇心キャッシュ、解決の旅路が有効
+- **フォワーディングモード** (`recursive.enabled = false`): 従来のupstream転送。再帰失敗時は自動フォールバック
+
+```toml
+[recursive]
+enabled = true
+root_hints_path = "root.hints"
+max_depth = 20
+parallel_branches = 3     # 同時探索するNSブランチ数
+curiosity_walk = true      # 好奇心散歩
+journey_txt = true         # 旅路TXTレコード
+```
 
 ## ビルド & 実行
 
@@ -190,6 +222,33 @@ TTL 切れ後もキャッシュから応答が返る。
 dig @<server-ip> google.com +tcp
 ```
 
+### 11. 再帰解決 (パラレルDFS)
+
+```bash
+# ルートサーバーからの再帰解決 (recursive.enabled = true の場合)
+dig @<server-ip> google.com A +timeout=15
+# ADDITIONAL セクションに旅路が表示される
+# neko-dns.journey. CH TXT ".[ROOT@0ms]->com[REFERRAL@23ms]->..."
+```
+
+### 12. 解決の旅路 (Journey API)
+
+```bash
+# 直近の再帰解決ジャーニーを取得
+curl http://<server-ip>:8053/api/journey?limit=5
+# 各ステップ (root→TLD→auth) の詳細が返る
+```
+
+### 13. 好奇心キャッシュ
+
+```bash
+# 好奇心キャッシュの統計確認
+curl http://<server-ip>:8053/api/journey | python3 -m json.tool
+# glue_entries: glueレコードキャッシュ数
+# walk_count: 散歩で先回り解決した回数
+# top_curious_zones: 好奇心スコアが高いゾーン
+```
+
 ## テストスクリプト
 
 `tests/` ディレクトリに自動テストスクリプトあり:
@@ -220,6 +279,9 @@ src/
 │   └── engine.rs    # クエリエンジン (全機能の統合)
 ├── cache.rs         # キャッシュレイヤー (DashMap)
 ├── upstream.rs      # マルチアップストリーム + 競争ロジック
+├── recursive.rs     # 🌲 再帰解決エンジン (パラレルDFS)
+├── journey.rs       # 🗺️ 解決の旅路トラッカー
+├── curiosity.rs     # 🐱 好奇心キャッシュ (glue日和見+散歩)
 ├── ttl_alchemy.rs   # TTL 再計算エンジン
 ├── prefetch.rs      # 予測プリフェッチ + 時間帯学習
 ├── trust.rs         # 信頼スコアリング
@@ -227,9 +289,11 @@ src/
 ├── journal.rs       # クエリジャーナル
 ├── edns.rs          # EDNS カスタム拡張
 ├── negative.rs      # ネガティブキャッシュ + typo推測
+├── neko_comment.rs  # 🐱 ネコのひとこと
 └── web/
     ├── mod.rs
     └── server.rs    # Axum Web UI サーバー
 static/
 └── dashboard.html   # ダッシュボード (組み込み SPA)
+root.hints           # IANA ルートヒントファイル
 ```

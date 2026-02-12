@@ -16,6 +16,8 @@ pub struct Config {
     pub web: WebConfig,
     #[serde(default)]
     pub neko_comment: NekoCommentConfig,
+    #[serde(default)]
+    pub recursive: RecursiveConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -152,6 +154,49 @@ impl Default for NekoCommentConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct RecursiveConfig {
+    /// 再帰解決を有効にする (falseならupstreamフォワードのみ)
+    #[serde(default)]
+    pub enabled: bool,
+    /// root.hints ファイルのパス
+    #[serde(default = "default_root_hints_path")]
+    pub root_hints_path: String,
+    /// 最大再帰深度
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    /// パラレルDFS分岐数 (同時に何個のNSを探索するか)
+    #[serde(default = "default_parallel_branches")]
+    pub parallel_branches: u32,
+    /// 各クエリのタイムアウト (ms)
+    #[serde(default = "default_recursive_timeout")]
+    pub query_timeout_ms: u64,
+    /// 好奇心散歩を有効にする
+    #[serde(default)]
+    pub curiosity_walk: bool,
+    /// 解決の旅路 (Journey) TXTレコードを追加する
+    #[serde(default = "default_true")]
+    pub journey_txt: bool,
+    /// 好奇心キャッシュのglue TTL (秒)
+    #[serde(default = "default_glue_ttl")]
+    pub glue_ttl_secs: u64,
+}
+
+impl Default for RecursiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root_hints_path: default_root_hints_path(),
+            max_depth: default_max_depth(),
+            parallel_branches: default_parallel_branches(),
+            query_timeout_ms: default_recursive_timeout(),
+            curiosity_walk: false,
+            journey_txt: true,
+            glue_ttl_secs: default_glue_ttl(),
+        }
+    }
+}
+
 // Default value functions
 fn default_timeout_ms() -> u64 { 2000 }
 fn default_max_entries() -> usize { 100_000 }
@@ -172,6 +217,11 @@ fn default_neg_ttl() -> u32 { 300 }
 fn default_edns_code() -> u16 { 65001 }
 fn default_web_address() -> String { "0.0.0.0".to_string() }
 fn default_web_port() -> u16 { 8053 }
+fn default_root_hints_path() -> String { "root.hints".to_string() }
+fn default_max_depth() -> u32 { 20 }
+fn default_parallel_branches() -> u32 { 3 }
+fn default_recursive_timeout() -> u64 { 2000 }
+fn default_glue_ttl() -> u64 { 3600 }
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {

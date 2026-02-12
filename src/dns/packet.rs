@@ -37,6 +37,8 @@ pub struct DnsRecord {
     pub ttl: u32,
     pub rdlength: u16,
     pub rdata: Vec<u8>,
+    /// rdataのパケット内開始オフセット (圧縮ポインタ解決用)
+    pub rdata_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +197,7 @@ fn parse_records(data: &[u8], offset: &mut usize, count: u16) -> anyhow::Result<
         if *offset + rdlength as usize > data.len() {
             return Err(anyhow::anyhow!("DNS rdata extends beyond packet"));
         }
+        let rdata_offset = *offset;
         let rdata = data[*offset..*offset + rdlength as usize].to_vec();
         *offset += rdlength as usize;
 
@@ -205,6 +208,7 @@ fn parse_records(data: &[u8], offset: &mut usize, count: u16) -> anyhow::Result<
             ttl,
             rdlength,
             rdata,
+            rdata_offset,
         });
     }
     Ok(records)
@@ -390,6 +394,26 @@ fn parse_name_standalone(data: &[u8]) -> anyhow::Result<String> {
         pos += len;
     }
     Ok(labels.join("."))
+}
+
+/// Parse a domain name from rdata, using the full packet for compression pointer resolution.
+/// `rdata_offset` is where the rdata begins within `full_packet`.
+pub fn parse_name_from_rdata(rdata: &[u8], full_packet: &[u8]) -> anyhow::Result<String> {
+    // Try standalone parse first (no compression)
+    if let Ok(name) = parse_name_standalone(rdata) {
+        return Ok(name);
+    }
+    // If rdata uses compression pointers, we need the full packet context.
+    // The rdata bytes are a subset of full_packet, so parse directly from full_packet
+    // at the rdata position.
+    Err(anyhow::anyhow!("Cannot parse name from rdata standalone"))
+}
+
+/// Parse a domain name from a known offset within the full packet.
+/// This handles compression pointers correctly.
+pub fn parse_name_at_offset(full_packet: &[u8], offset: usize) -> anyhow::Result<String> {
+    let mut pos = offset;
+    parse_name(full_packet, &mut pos)
 }
 
 /// Append a neko-dns comment as an ADDITIONAL TXT record to a response

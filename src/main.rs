@@ -11,6 +11,9 @@ mod trust;
 mod edns;
 mod negative;
 mod neko_comment;
+mod recursive;
+mod journey;
+mod curiosity;
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -55,6 +58,12 @@ async fn main() -> anyhow::Result<()> {
     let trust_engine = engine.clone();
     tokio::spawn(async move {
         trust_engine.run_trust_scorer().await;
+    });
+
+    // Start curiosity walk loop (recursive mode only)
+    let curiosity_engine = engine.clone();
+    tokio::spawn(async move {
+        curiosity_engine.run_curiosity_walk_loop().await;
     });
 
     // Start Web UI

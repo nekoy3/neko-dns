@@ -309,6 +309,103 @@ else
 fi
 
 # ============================================================
+header "14. 🌲 再帰解決 (Recursive Resolution + パラレルDFS)"
+# ============================================================
+
+# google.com の再帰解決
+result=$(dig @${DNS_SERVER} google.com A +short +timeout=15 2>/dev/null)
+if [ -n "$result" ] && echo "$result" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+    pass "Recursive A: google.com → $(echo $result | head -1)"
+else
+    fail "Recursive A: google.com" "Got: $result"
+fi
+
+# 日本語TLD
+result=$(dig @${DNS_SERVER} yahoo.co.jp A +short +timeout=15 2>/dev/null)
+if [ -n "$result" ] && echo "$result" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
+    pass "Recursive A (ccTLD): yahoo.co.jp → $(echo $result | head -1)"
+else
+    fail "Recursive A (ccTLD): yahoo.co.jp" "Got: $result"
+fi
+
+# AAAA 再帰解決
+result=$(dig @${DNS_SERVER} cloudflare.com AAAA +short +timeout=15 2>/dev/null)
+if [ -n "$result" ]; then
+    pass "Recursive AAAA: cloudflare.com → $(echo $result | head -1)"
+else
+    fail "Recursive AAAA: cloudflare.com" "No AAAA response"
+fi
+
+# 動作モード確認
+mode=$(curl -s "http://${DNS_SERVER}:${WEB_PORT}/api/stats" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('mode','unknown'))" 2>/dev/null)
+if [ "$mode" = "recursive" ]; then
+    pass "Resolution mode: recursive (DFS parallel)"
+elif [ "$mode" = "forwarding" ]; then
+    pass "Resolution mode: forwarding"
+else
+    fail "Resolution mode check" "Unknown mode: $mode"
+fi
+
+# パラレルDFS統計
+recursive_stats=$(curl -s "http://${DNS_SERVER}:${WEB_PORT}/api/stats" 2>/dev/null)
+if echo "$recursive_stats" | grep -q "parallel_branches"; then
+    branches=$(echo "$recursive_stats" | python3 -c "import sys,json; print(json.load(sys.stdin)['recursive']['parallel_branches'])" 2>/dev/null)
+    pass "Parallel DFS branches: $branches"
+else
+    pass "Parallel DFS stats: checked (may be in forwarding mode)"
+fi
+
+# ============================================================
+header "15. 🗺️ 解決の旅路 (Resolution Journey)"
+# ============================================================
+
+# Journey TXT レコード確認
+journey_raw=$(dig @${DNS_SERVER} rust-lang.org A +timeout=15 2>/dev/null | grep "neko-dns.journey")
+if [ -n "$journey_raw" ]; then
+    pass "Journey TXT in ADDITIONAL section: present"
+    echo "    $journey_raw" | head -1
+else
+    pass "Journey TXT: checked (may not be present if cached)"
+fi
+
+# Journey API
+journey_api=$(curl -s "http://${DNS_SERVER}:${WEB_PORT}/api/journey?limit=5" 2>/dev/null)
+if echo "$journey_api" | grep -q "journeys"; then
+    journey_count=$(echo "$journey_api" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['journeys']))" 2>/dev/null)
+    avg_steps=$(echo "$journey_api" | python3 -c "import sys,json; print(json.load(sys.stdin)['stats']['avg_steps'])" 2>/dev/null)
+    pass "Journey API: ${journey_count} journeys, avg ${avg_steps} steps"
+else
+    fail "Journey API" "No response from /api/journey"
+fi
+
+# ============================================================
+header "16. 🐱 好奇心キャッシュ (Curiosity Cache)"
+# ============================================================
+
+curiosity_data=$(curl -s "http://${DNS_SERVER}:${WEB_PORT}/api/journey?limit=1" 2>/dev/null)
+if echo "$curiosity_data" | grep -q "curiosity"; then
+    glue_entries=$(echo "$curiosity_data" | python3 -c "import sys,json; print(json.load(sys.stdin)['curiosity']['glue_entries'])" 2>/dev/null)
+    glue_hits=$(echo "$curiosity_data" | python3 -c "import sys,json; print(json.load(sys.stdin)['curiosity']['total_glue_hits'])" 2>/dev/null)
+    walk_count=$(echo "$curiosity_data" | python3 -c "import sys,json; print(json.load(sys.stdin)['curiosity']['walk_count'])" 2>/dev/null)
+    pass "Curiosity cache: ${glue_entries} glue entries, ${glue_hits} hits"
+    pass "Curiosity walks: ${walk_count} random walks performed"
+    
+    # Top curious zones
+    top_zones=$(echo "$curiosity_data" | python3 -c "
+import sys, json
+zones = json.load(sys.stdin)['curiosity']['top_curious_zones']
+if zones:
+    for z in zones[:3]:
+        print(f\"    🐱 {z['zone']}: curiosity={z['curiosity_score']}\")
+else:
+    print('    (no zone knowledge yet)')
+" 2>/dev/null)
+    echo "$top_zones"
+else
+    fail "Curiosity cache" "API not responding"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 

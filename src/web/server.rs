@@ -51,6 +51,7 @@ impl WebServer {
             .route("/api/cache", get(api_cache))
             .route("/api/journal", get(api_journal))
             .route("/api/upstreams", get(api_upstreams))
+            .route("/api/journey", get(api_journey))
             .with_state(state);
 
         let addr = format!("{}:{}", self.config.web.address, self.config.web.port);
@@ -101,4 +102,18 @@ async fn api_journal(
 /// Upstreams API
 async fn api_upstreams(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(state.engine.upstream.get_stats())
+}
+
+/// Journey API - 再帰解決の旅路履歴
+async fn api_journey(
+    State(state): State<AppState>,
+    Query(params): Query<JournalQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(20);
+    let history = state.engine.get_journey_history(limit);
+    Json(serde_json::json!({
+        "journeys": history,
+        "stats": state.engine.journey.get_stats(),
+        "curiosity": state.engine.curiosity.get_stats(),
+    }))
 }

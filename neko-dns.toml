@@ -81,3 +81,14 @@ port = 8053
 # 🐱 ネコのひとこと（ADDITIONALセクションにTXTレコードでひとこと添える）
 [neko_comment]
 enabled = true
+
+# 🌲 再帰解決（ルートヒントからの反復解決 + パラレルDFS探索）
+[recursive]
+enabled = true                # true: 再帰解決, false: upstream転送
+root_hints_path = "root.hints"
+max_depth = 20                # 最大再帰深度
+parallel_branches = 3         # 同時探索するNSブランチ数
+query_timeout_ms = 2000       # 各クエリのタイムアウト
+curiosity_walk = true         # 🐱 好奇心散歩を有効化
+journey_txt = true            # 🗺️ 解決の旅路TXTレコード追加
+glue_ttl_secs = 3600          # glueキャッシュのTTL
