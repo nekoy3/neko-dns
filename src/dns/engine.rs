@@ -288,10 +288,9 @@ impl QueryEngine {
 
             for (name, qtype) in candidates {
                 debug!("Prefetching: {} {}", name, qtype.name());
+                // Use handle_query so recursive mode is respected
                 let query = packet::build_query({ use rand::rngs::OsRng; use rand::Rng; OsRng.gen() }, &name, qtype, true);
-                if let Ok(result) = self.upstream.race_query(&query).await {
-                    self.cache.insert(&name, &qtype, &result.response, &result.upstream_name).await;
-                }
+                let _ = self.handle_query(&query).await;
             }
         }
     }
