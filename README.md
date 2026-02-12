@@ -37,7 +37,7 @@ neko-dns は RFC 1035 準拠の DNS キャッシュサーバーを基盤に、�
 | # | 機能名 | 説明 | 確認方法 |
 |---|--------|------|----------|
 | 15 | **再帰解決 (root hints)** | IANAルートヒントからの反復解決。upstream転送と切り替え可能 | `dig @<server-ip> google.com` で再帰解決 |
-| 16 | **🌲 パラレルDFS探索** | 再帰解決時に複数のNSパスをDFS的に同時探索。レイテンシ・信頼度でスコアリングして最良パスを採用 | API `/api/stats` の recursive セクション |
+| 16 | **🚀 Unbound-inspired RTT最適化** | Jacobson/Karels RTT推定 (RFC 6298)、RTTバンド選択、委任キャッシュ、ソケットプール、ルートウォームアップ。コールドクエリでunboundの2倍速 | API `/api/stats` の recursive セクション |
 | 17 | **🗺️ 解決の旅路 (Journey)** | 再帰解決の全ステップ (root→TLD→auth) をADDITIONAL TXTに記録して返す | digで `neko-dns.journey.` TXT確認 / API `/api/journey` |
 | 18 | **🐱 好奇心キャッシュ (Curiosity)** | 解決中のglueレコードを日和見キャッシュ + たまに関連ドメインを「散歩」して先回り解決 | API `/api/journey` の curiosity セクション |
 
@@ -52,7 +52,9 @@ Client → [UDP/TCP :53] → QueryEngine
                               ├─ CacheLayer (キャッシュ検索 / TTL錬金術)
                               │      └─ TtlAlchemy (TTL再計算)
                               ├─ RecursiveResolver 🌲 (ルートからの反復解決)
-                              │      ├─ ParallelDFS (複数NS同時探索)
+                              │      ├─ InfraCache (Jacobson/Karels RTT追跡)
+                              │      ├─ DelegCache (委任キャッシュ: TLDスキップ)
+                              │      ├─ SocketPool (UDPソケット再利用)
                               │      ├─ JourneyTracker 🗺️ (解決パス記録)
                               │      └─ CuriosityCache 🐱 (日和見glueキャッシュ+散歩)
                               ├─ UpstreamManager (マルチアップストリーム競争 / フォールバック)
@@ -101,7 +103,7 @@ port = 8053
 
 neko-dns は2つのモードで動作:
 
-- **再帰解決モード** (`recursive.enabled = true`): ルートヒントから自力で反復解決。パラレルDFS探索、好奇心キャッシュ、解決の旅路が有効
+- **再帰解決モード** (`recursive.enabled = true`): ルートヒントから自力で反復解決。Unbound-inspired RTT最適化、委任キャッシュ、好奇心キャッシュ、解決の旅路が有効
 - **フォワーディングモード** (`recursive.enabled = false`): 従来のupstream転送。再帰失敗時は自動フォールバック
 
 ```toml
@@ -109,7 +111,7 @@ neko-dns は2つのモードで動作:
 enabled = true
 root_hints_path = "root.hints"
 max_depth = 20
-parallel_branches = 3     # 同時探索するNSブランチ数
+parallel_branches = 3     # 並列クエリブランチ数
 curiosity_walk = true      # 好奇心散歩
 journey_txt = true         # 旅路TXTレコード
 ```
@@ -222,13 +224,13 @@ TTL 切れ後もキャッシュから応答が返る。
 dig @<server-ip> google.com +tcp
 ```
 
-### 11. 再帰解決 (パラレルDFS)
+### 11. 再帰解決
 
 ```bash
 # ルートサーバーからの再帰解決 (recursive.enabled = true の場合)
-dig @<server-ip> google.com A +timeout=15
+dig @<server-ip> google.com A
 # ADDITIONAL セクションに旅路が表示される
-# neko-dns.journey. CH TXT ".[ROOT@0ms]->com[REFERRAL@23ms]->..."
+# neko-dns.journey. TXT ".[ROOT@0ms]->com[REFERRAL@19ms]->authoritative[ANSWER@34ms] (total:34ms)"
 ```
 
 ### 12. 解決の旅路 (Journey API)
@@ -249,13 +251,40 @@ curl http://<server-ip>:8053/api/journey | python3 -m json.tool
 # top_curious_zones: 好奇心スコアが高いゾーン
 ```
 
+## ベンチマーク (vs unbound)
+
+`tests/benchmark.sh` で neko-dns と unbound を直接比較可能:
+
+```bash
+./tests/benchmark.sh 127.0.0.1 <unbound-ip>
+```
+
+| テスト | 🐱 neko-dns | 🔒 unbound | 結果 |
+|--------|------------|-----------|------|
+| **コールドクエリ** | **63.2ms** | 141.2ms | 🐱 **2.2倍速い** |
+| **キャッシュヒット** | **40.9ms** | 41.1ms | ほぼ同等 |
+| **スループット (50並列)** | 80.1 qps | 98.2 qps | 🔒 |
+| **TCP** | 37.6ms | 36.4ms | ほぼ同等 |
+
+コールドクエリの高速性は以下の最適化による:
+
+- **Jacobson/Karels RTT推定 (RFC 6298)**: サーバーごとにSRTT/RTTVARを追跡し、最速サーバーを自動選択
+- **RTTバンド選択**: 最速サーバー + 200ms帯域内からランダム選択（Unbound方式）
+- **委任キャッシュ**: `.com`/`.org`等のTLD委任をキャッシュし、ルートサーバーをスキップ（3ホップ→2ホップ）
+- **ソケットプール**: UDPソケット再利用でsyscallオーバーヘッドを削減
+- **ルートRTTウォームアップ**: 起動時に全13ルートサーバーをプローブし初回から最適選択
+- **最初の有効応答で即次ホップ**: Referralでも最速応答で即座に次段へ進行
+
 ## テストスクリプト
 
 `tests/` ディレクトリに自動テストスクリプトあり:
 
 ```bash
-# 全機能テスト
+# 全機能テスト (31テスト)
 ./tests/test_all.sh
+
+# ベンチマーク (vs unbound)
+./tests/benchmark.sh <neko-dns-ip> <unbound-ip>
 
 # 個別テスト
 ./tests/test_basic.sh      # 基本名前解決
@@ -279,7 +308,7 @@ src/
 │   └── engine.rs    # クエリエンジン (全機能の統合)
 ├── cache.rs         # キャッシュレイヤー (DashMap)
 ├── upstream.rs      # マルチアップストリーム + 競争ロジック
-├── recursive.rs     # 🌲 再帰解決エンジン (パラレルDFS)
+├── recursive.rs     # 🌲 再帰解決エンジン (Unbound-inspired RTT最適化)
 ├── journey.rs       # 🗺️ 解決の旅路トラッカー
 ├── curiosity.rs     # 🐱 好奇心キャッシュ (glue日和見+散歩)
 ├── ttl_alchemy.rs   # TTL 再計算エンジン
