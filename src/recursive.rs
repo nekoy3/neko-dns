@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn, trace};
 
 use crate::config::RecursiveConfig;
@@ -293,18 +294,52 @@ impl RecursiveResolver {
                     }
 
                     if next_servers.is_empty() {
-                        // NSのIPが不明 → 再帰的にNS自体を解決（深さ制限あり）
+                        // NSのIPが不明 → 再帰的にNS自体を解決（並列処理, 深さ制限あり）
                         if depth + 1 < max_depth {
-                            for ns_name in ns_names.iter().take(2) {
-                                debug!("🌲 Resolving NS address: {}", ns_name);
-                                if let Ok(ns_response) = self
-                                    .resolve_ns_address(ns_name, curiosity, journey)
-                                    .await
-                                {
-                                    for ip in ns_response {
-                                        next_servers.push(SocketAddr::new(ip, 53));
+                            let ns_to_resolve: Vec<&String> = ns_names.iter().take(3).collect();
+                            debug!(
+                                "🌲 Parallel NS resolution: {} names: {:?}",
+                                ns_to_resolve.len(),
+                                ns_to_resolve
+                            );
+
+                            // tokio::join! で並列にNSアドレスを解決（同一タスク上の協調スケジューリング）
+                            match ns_to_resolve.len() {
+                                3 => {
+                                    let (r1, r2, r3) = tokio::join!(
+                                        self.resolve_ns_address(ns_to_resolve[0], curiosity, journey),
+                                        self.resolve_ns_address(ns_to_resolve[1], curiosity, journey),
+                                        self.resolve_ns_address(ns_to_resolve[2], curiosity, journey),
+                                    );
+                                    for r in [r1, r2, r3] {
+                                        if let Ok(ips) = r {
+                                            for ip in ips {
+                                                next_servers.push(SocketAddr::new(ip, 53));
+                                            }
+                                        }
                                     }
                                 }
+                                2 => {
+                                    let (r1, r2) = tokio::join!(
+                                        self.resolve_ns_address(ns_to_resolve[0], curiosity, journey),
+                                        self.resolve_ns_address(ns_to_resolve[1], curiosity, journey),
+                                    );
+                                    for r in [r1, r2] {
+                                        if let Ok(ips) = r {
+                                            for ip in ips {
+                                                next_servers.push(SocketAddr::new(ip, 53));
+                                            }
+                                        }
+                                    }
+                                }
+                                1 => {
+                                    if let Ok(ips) = self.resolve_ns_address(ns_to_resolve[0], curiosity, journey).await {
+                                        for ip in ips {
+                                            next_servers.push(SocketAddr::new(ip, 53));
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -362,7 +397,8 @@ impl RecursiveResolver {
         }
     }
 
-    /// パラレルDFS: 複数のNSに同時にクエリを投げてすべての結果を収集
+    /// パラレルDFS: JoinSet + 最初のAnswer即リターン + 残ブランチ自動キャンセル
+    /// tokio JoinSetによる真のマルチスレッド分散 + adaptive timeout
     async fn parallel_dfs_query(
         &self,
         qname: &str,
@@ -370,38 +406,65 @@ impl RecursiveResolver {
         servers: &[SocketAddr],
         depth: u32,
     ) -> Vec<(DfsResult, Duration)> {
-        let timeout = Duration::from_millis(self.config.query_timeout_ms);
-        let mut tasks = Vec::new();
+        let base_timeout_ms = self.config.query_timeout_ms;
+        // Adaptive timeout: deeper levels get tighter timeouts (min 500ms)
+        // This prevents slow deep branches from blocking the entire resolution
+        let adaptive_ms = ((base_timeout_ms as f64) * (1.0 - depth as f64 * 0.08)).max(500.0) as u64;
+        let timeout = Duration::from_millis(adaptive_ms);
+
+        trace!(
+            "🌲 DFS depth {}: timeout {}ms (base {}ms, adaptive)",
+            depth, adaptive_ms, base_timeout_ms
+        );
+
+        let mut set = JoinSet::new();
 
         for &addr in servers {
             let name = qname.to_string();
             let qt = qtype;
             let to = timeout;
 
-            tasks.push(tokio::spawn(async move {
+            set.spawn(async move {
                 let start = Instant::now();
                 match Self::send_query(&name, qt, addr, to).await {
                     Ok(response) => {
                         let latency = start.elapsed();
                         let result = Self::classify_response(&response, &name);
-                        (result, latency)
+                        (result, latency, addr)
                     }
                     Err(e) => {
                         let latency = start.elapsed();
-                        (DfsResult::Error(format!("{}: {}", addr, e)), latency)
+                        (DfsResult::Error(format!("{}: {}", addr, e)), latency, addr)
                     }
                 }
-            }));
+            });
         }
 
         let mut results = Vec::new();
-        for task in tasks {
-            if let Ok(result) = task.await {
-                results.push(result);
+
+        // Process results as they complete (fastest-first ordering)
+        while let Some(join_result) = set.join_next().await {
+            if let Ok((result, latency, addr)) = join_result {
+                let is_answer = matches!(&result, DfsResult::Answer(_));
+                results.push((result, latency));
+
+                // 🚀 Early exit: Answer found → cancel all remaining branches
+                // This is the key optimization: don't wait for slow servers
+                if is_answer {
+                    let remaining = set.len();
+                    if remaining > 0 {
+                        debug!(
+                            "🌲 Early answer at depth {} from {} ({:.1}ms), cancelling {} remaining branches",
+                            depth, addr, latency.as_millis(), remaining
+                        );
+                        set.abort_all();
+                    }
+                    break;
+                }
             }
         }
 
-        // スコア順にソート (レイテンシ低い順)
+        // Sort by latency (fastest first)
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
@@ -537,7 +600,7 @@ impl RecursiveResolver {
         latency_score * depth_penalty * type_bonus
     }
 
-    /// NSサーバーのIPアドレスを解決 (再帰的)
+    /// NSサーバーのIPアドレスを解決 (再帰的, 並列クエリ対応)
     async fn resolve_ns_address(
         &self,
         ns_name: &str,
@@ -553,17 +616,36 @@ impl RecursiveResolver {
             .filter_map(|s| s.ipv4.map(|ip| SocketAddr::new(IpAddr::V4(ip), 53)))
             .collect();
 
-        let timeout = Duration::from_millis(self.config.query_timeout_ms);
+        let base_timeout = Duration::from_millis(self.config.query_timeout_ms);
 
         for depth in 0..self.config.max_depth {
             if current_servers.is_empty() {
                 break;
             }
 
-            // 最初の2つに問い合わせ
-            let addr = current_servers[0];
-            match Self::send_query(ns_name, RecordType::A, addr, timeout).await {
-                Ok(response) => {
+            // Adaptive timeout for NS resolution too
+            let adaptive_ms = ((base_timeout.as_millis() as f64) * (1.0 - depth as f64 * 0.1)).max(500.0) as u64;
+            let timeout = Duration::from_millis(adaptive_ms);
+
+            // 最大2サーバーに並列クエリ (tokio::join! で同時実行)
+            let servers_to_try: Vec<SocketAddr> = current_servers.iter().take(2).cloned().collect();
+
+            let query_results = if servers_to_try.len() >= 2 {
+                let (r1, r2) = tokio::join!(
+                    Self::send_query(ns_name, RecordType::A, servers_to_try[0], timeout),
+                    Self::send_query(ns_name, RecordType::A, servers_to_try[1], timeout),
+                );
+                vec![r1, r2]
+            } else {
+                vec![Self::send_query(ns_name, RecordType::A, servers_to_try[0], timeout).await]
+            };
+
+            // Process results: prefer Answer, fallback to Referral
+            let mut got_answer = false;
+            let mut got_referral = false;
+
+            for query_result in query_results {
+                if let Ok(response) = query_result {
                     let result = Self::classify_response(&response, ns_name);
                     match result {
                         DfsResult::Answer(data) => {
@@ -587,6 +669,7 @@ impl RecursiveResolver {
                                 curiosity.store_glue(ns_name, &ips);
                                 return Ok(ips);
                             }
+                            got_answer = true;
                         }
                         DfsResult::Referral {
                             ns_addrs,
@@ -596,20 +679,31 @@ impl RecursiveResolver {
                             for (name, ips) in &glue_records {
                                 curiosity.store_glue(name, ips);
                             }
-                            if !ns_addrs.is_empty() {
+                            if !ns_addrs.is_empty() && !got_referral {
                                 current_servers = ns_addrs;
-                                continue;
+                                got_referral = true;
                             }
                         }
                         _ => {}
                     }
                 }
-                Err(_) => {
-                    current_servers.remove(0);
-                    continue;
-                }
             }
-            break;
+
+            if got_referral {
+                continue;
+            }
+            if got_answer {
+                // Answer was found but had no A records - stop
+                break;
+            }
+
+            // All queries failed - remove first server and try again
+            if !current_servers.is_empty() {
+                current_servers.remove(0);
+            }
+            if current_servers.is_empty() {
+                break;
+            }
         }
 
         Err(anyhow::anyhow!("Failed to resolve NS address: {}", ns_name))
