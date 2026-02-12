@@ -1,0 +1,83 @@
+# neko-dns 設定ファイル
+
+[listen]
+address = "0.0.0.0"
+port = 53
+
+# Upstream DNSサーバー（全部に同時にクエリを投げて最速を採用）
+[[upstreams]]
+name = "google-primary"
+address = "8.8.8.8"
+port = 53
+timeout_ms = 2000
+
+[[upstreams]]
+name = "google-secondary"
+address = "8.8.4.4"
+port = 53
+timeout_ms = 2000
+
+[[upstreams]]
+name = "cloudflare"
+address = "1.1.1.1"
+port = 53
+timeout_ms = 2000
+
+[[upstreams]]
+name = "quad9"
+address = "9.9.9.9"
+port = 53
+timeout_ms = 2000
+
+[cache]
+max_entries = 100000
+serve_stale = true        # TTL切れでもstale応答を返す (RFC 8767)
+stale_ttl_secs = 86400    # stale応答の最大保持時間
+
+[ttl_alchemy]
+enabled = true
+min_ttl = 30
+max_ttl = 86400
+frequency_weight = 0.3    # クエリ頻度がTTL延長に影響する度合い
+volatility_weight = 0.5   # 応答変動がTTL短縮に影響する度合い
+
+[prefetch]
+enabled = true
+threshold_ratio = 0.1     # TTL残り10%で先回りリフレッシュ
+learn_patterns = false    # 時間帯パターン学習（将来機能）
+check_interval_secs = 10
+
+[trust]
+enabled = true
+min_score = 0.5           # この値以下のupstreamは自動無効化
+recalc_interval_secs = 60
+
+[chaos]
+enabled = false            # カオスモード（有効にすると障害注入）
+servfail_probability = 0.01  # 1%の確率でSERVFAIL
+exclude_domains = [        # カオスから除外するドメイン
+    "example.com",
+]
+
+[journal]
+enabled = true
+max_entries = 1000000
+retention_hours = 168      # 7日間保持
+
+[negative]
+enabled = true
+speculative = false        # typo推測ネガキャッシュ（実験的）
+default_ttl = 300
+
+[edns]
+enabled = true
+custom_option_code = 65001 # Private Use range
+
+[web]
+enabled = true
+address = "0.0.0.0"
+port = 8053
+
+# 🐱 ネコのひとこと（ADDITIONALセクションにTXTレコードでひとこと添える）
+[neko_comment]
+enabled = true

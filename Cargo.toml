@@ -1,0 +1,46 @@
+[package]
+name = "neko-dns"
+description = "custom rust cache dns server - 変なキャッシュDNS"
+version = "0.1.0"
+edition = "2021"
+authors = ["nekoy"]
+
+[dependencies]
+# Error handling
+anyhow = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Web UI
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random (for chaos mode etc.)
+rand = "0.8"
+
+# Dashmap for concurrent cache
+dashmap = "5"
+
+# Stats / metrics
+parking_lot = "0.12"
+
+[dev-dependencies]
+# For integration tests
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "neko-dns"
+path = "src/main.rs"

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🐱 neko-dns Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #00ff88;
+            padding: 20px;
+        }
+        h1 { font-size: 24px; margin-bottom: 20px; color: #ff6b9d; }
+        h2 { font-size: 16px; margin: 15px 0 8px; color: #ffd700; border-bottom: 1px solid #333; padding-bottom: 4px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px; }
+        .card {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .stat-row { display: flex; justify-content: space-between; padding: 3px 0; }
+        .stat-label { color: #888; }
+        .stat-value { color: #00ff88; font-weight: bold; }
+        .stat-value.warn { color: #ffa500; }
+        .stat-value.bad { color: #ff4444; }
+        .stat-value.good { color: #00ff88; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        th { text-align: left; color: #ffd700; padding: 5px; border-bottom: 1px solid #444; }
+        td { padding: 4px 5px; border-bottom: 1px solid #1a1a1a; }
+        tr:hover td { background: #1a1a1a; }
+        .upstream-bar {
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .upstream-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+        .refresh-info { color: #555; font-size: 11px; text-align: right; }
+        #chaos-indicator {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .chaos-on { background: #ff4444; color: #fff; animation: pulse 1s infinite; }
+        .chaos-off { background: #333; color: #666; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .search-box {
+            background: #111;
+            border: 1px solid #444;
+            color: #00ff88;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-family: inherit;
+            width: 250px;
+        }
+        .search-box:focus { outline: none; border-color: #00ff88; }
+    </style>
+</head>
+<body>
+    <h1>🐱 neko-dns <span style="color:#555;font-size:14px">dashboard</span></h1>
+
+    <div class="grid">
+        <!-- Cache Stats -->
+        <div class="card">
+            <h2>📦 Cache</h2>
+            <div class="stat-row">
+                <span class="stat-label">Entries</span>
+                <span class="stat-value" id="cache-entries">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Hit Rate</span>
+                <span class="stat-value" id="cache-hitrate">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Hits / Misses</span>
+                <span class="stat-value" id="cache-hits-misses">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Evictions</span>
+                <span class="stat-value" id="cache-evictions">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Serve Stale</span>
+                <span class="stat-value" id="cache-stale">-</span>
+            </div>
+        </div>
+
+        <!-- Upstream Stats -->
+        <div class="card">
+            <h2>🏎️ Upstreams</h2>
+            <div id="upstream-list"></div>
+        </div>
+
+        <!-- Chaos Engine -->
+        <div class="card">
+            <h2>🎲 Chaos Engine <span id="chaos-indicator" class="chaos-off">OFF</span></h2>
+            <div class="stat-row">
+                <span class="stat-label">Checked</span>
+                <span class="stat-value" id="chaos-checked">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Injected</span>
+                <span class="stat-value" id="chaos-injected">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Probability</span>
+                <span class="stat-value" id="chaos-prob">-</span>
+            </div>
+        </div>
+
+        <!-- Negative Cache -->
+        <div class="card">
+            <h2>🚫 Negative Cache</h2>
+            <div class="stat-row">
+                <span class="stat-label">Entries</span>
+                <span class="stat-value" id="neg-entries">-</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Speculative</span>
+                <span class="stat-value" id="neg-speculative">-</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Journal -->
+    <div class="card">
+        <h2>📜 Query Journal (recent)</h2>
+        <div style="margin-bottom: 10px;">
+            <input type="text" class="search-box" id="journal-search" placeholder="Search domain...">
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Domain</th>
+                    <th>Type</th>
+                    <th>Upstream</th>
+                    <th>TTL</th>
+                    <th>Latency</th>
+                </tr>
+            </thead>
+            <tbody id="journal-body"></tbody>
+        </table>
+    </div>
+
+    <!-- Cache Entries -->
+    <div class="card" style="margin-top:15px;">
+        <h2>🗄️ Cache Entries</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Type</th>
+                    <th>Original TTL</th>
+                    <th>Alchemized TTL</th>
+                    <th>Remaining</th>
+                    <th>Hits</th>
+                    <th>Δ Changes</th>
+                    <th>Upstream</th>
+                </tr>
+            </thead>
+            <tbody id="cache-body"></tbody>
+        </table>
+    </div>
+
+    <p class="refresh-info" style="margin-top:10px;">Auto-refresh: 2s | <span id="last-update">-</span></p>
+
+    <script>
+        async function fetchJSON(url) {
+            const res = await fetch(url);
+            return res.json();
+        }
+
+        function trustColor(score) {
+            const s = parseFloat(score);
+            if (s >= 0.8) return '#00ff88';
+            if (s >= 0.6) return '#ffa500';
+            return '#ff4444';
+        }
+
+        async function refresh() {
+            try {
+                const [stats, cache, journal] = await Promise.all([
+                    fetchJSON('/api/stats'),
+                    fetchJSON('/api/cache'),
+                    fetchJSON('/api/journal?limit=50'),
+                ]);
+
+                // Cache stats
+                const c = stats.cache;
+                document.getElementById('cache-entries').textContent = `${c.entries} / ${c.max_entries}`;
+                document.getElementById('cache-hitrate').textContent = `${c.hit_rate_percent}%`;
+                document.getElementById('cache-hits-misses').textContent = `${c.hits} / ${c.misses}`;
+                document.getElementById('cache-evictions').textContent = c.evictions;
+                document.getElementById('cache-stale').textContent = c.serve_stale ? 'ON' : 'OFF';
+
+                // Upstreams
+                const upstreams = stats.upstreams;
+                let upHtml = '';
+                for (const u of upstreams) {
+                    const color = trustColor(u.trust_score);
+                    const barWidth = (parseFloat(u.trust_score) * 100).toFixed(0);
+                    upHtml += `
+                        <div style="margin-bottom:10px;">
+                            <div class="stat-row">
+                                <span class="stat-label">${u.name} ${u.disabled ? '⛔' : '✅'}</span>
+                                <span class="stat-value" style="color:${color}">Trust: ${u.trust_score}</span>
+                            </div>
+                            <div class="stat-row">
+                                <span class="stat-label" style="font-size:11px">${u.address}</span>
+                                <span style="font-size:11px;color:#888">Q:${u.total_queries} F:${u.total_failures} Lat:${u.avg_latency_ms}ms</span>
+                            </div>
+                            <div class="upstream-bar">
+                                <div class="upstream-bar-fill" style="width:${barWidth}%;background:${color}"></div>
+                            </div>
+                        </div>`;
+                }
+                document.getElementById('upstream-list').innerHTML = upHtml;
+
+                // Chaos
+                const ch = stats.chaos;
+                const indicator = document.getElementById('chaos-indicator');
+                indicator.textContent = ch.enabled ? 'ON' : 'OFF';
+                indicator.className = ch.enabled ? 'chaos-on' : 'chaos-off';
+                document.getElementById('chaos-checked').textContent = ch.total_checked;
+                document.getElementById('chaos-injected').textContent = ch.total_injected;
+                document.getElementById('chaos-prob').textContent = `${(ch.probability * 100).toFixed(1)}%`;
+
+                // Negative cache
+                const neg = stats.negative_cache;
+                document.getElementById('neg-entries').textContent = neg.total_entries;
+                document.getElementById('neg-speculative').textContent = neg.speculative_entries;
+
+                // Journal
+                const searchTerm = document.getElementById('journal-search').value.toLowerCase();
+                let jHtml = '';
+                for (const e of journal.entries) {
+                    if (searchTerm && !e.domain.toLowerCase().includes(searchTerm)) continue;
+                    const latMs = (e.latency_us / 1000).toFixed(1);
+                    const time = e.timestamp.split('T')[1].replace('Z', '');
+                    jHtml += `<tr>
+                        <td style="color:#555">${time}</td>
+                        <td>${e.domain}</td>
+                        <td style="color:#ffd700">${e.qtype}</td>
+                        <td>${e.upstream}</td>
+                        <td>${e.ttl}s</td>
+                        <td>${latMs}ms</td>
+                    </tr>`;
+                }
+                document.getElementById('journal-body').innerHTML = jHtml;
+
+                // Cache entries
+                let ceHtml = '';
+                for (const e of cache.entries) {
+                    const ttlColor = e.alchemized_ttl > e.original_ttl ? '#00ff88' : 
+                                     e.alchemized_ttl < e.original_ttl ? '#ff6b9d' : '#888';
+                    ceHtml += `<tr>
+                        <td>${e.name}</td>
+                        <td style="color:#ffd700">${e.type}</td>
+                        <td>${e.original_ttl}s</td>
+                        <td style="color:${ttlColor}">${e.alchemized_ttl}s</td>
+                        <td>${e.remaining_ttl}s</td>
+                        <td>${e.hits}</td>
+                        <td>${e.rdata_changes}</td>
+                        <td style="color:#555">${e.upstream}</td>
+                    </tr>`;
+                }
+                document.getElementById('cache-body').innerHTML = ceHtml;
+
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+            } catch (e) {
+                console.error('Refresh error:', e);
+            }
+        }
+
+        refresh();
+        setInterval(refresh, 2000);
+    </script>
+</body>
+</html>
