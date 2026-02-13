@@ -625,7 +625,7 @@ impl RecursiveResolver {
         if servers.len() == 1 {
             let addr = servers[0];
             let server_rto = self.infra_cache.get(&addr.ip()).map(|r| r.rto as u64).unwrap_or(adaptive_ms);
-            let timeout = Duration::from_millis(adaptive_ms.min((server_rto * 3 / 2).max(200)));
+            let timeout = Duration::from_millis(adaptive_ms.min((server_rto * 2).max(500)));
             let start = Instant::now();
             match Self::send_query_pooled(&self.socket_pool, qname, qtype, addr, timeout).await {
                 Ok(response) => {
@@ -658,7 +658,7 @@ impl RecursiveResolver {
 
             // Per-server timeout: use server RTO if known, else adaptive
             let server_rto = inf.get(&addr.ip()).map(|r| r.rto as u64).unwrap_or(adaptive_ms);
-            let timeout_ms = adaptive_ms.min((server_rto * 3 / 2).max(200));
+            let timeout_ms = adaptive_ms.min((server_rto * 2).max(500));
             let timeout = Duration::from_millis(timeout_ms);
 
             set.spawn(async move {
@@ -781,6 +781,7 @@ impl RecursiveResolver {
             let mut ns_addrs = Vec::new();
             let mut glue_records: Vec<(String, Vec<IpAddr>)> = Vec::new();
             let mut new_zone = String::new();
+            let mut has_soa = false;
 
             for record in &parsed.authorities {
                 if record.rtype == RecordType::NS {
@@ -790,7 +791,16 @@ impl RecursiveResolver {
                     } else if let Ok(ns_name) = packet::parse_name_from_rdata(&record.rdata, response) {
                         ns_names.push(ns_name);
                     }
+                } else if record.rtype == RecordType::SOA {
+                    has_soa = true;
                 }
+            }
+
+            // NODATA response: authority has SOA but no NS records
+            // This means the authoritative server confirmed the name exists
+            // but has no records of the requested type — return as Answer
+            if ns_names.is_empty() && has_soa {
+                return DfsResult::Answer(response.to_vec());
             }
 
             let mut glue_map: HashMap<String, Vec<IpAddr>> = HashMap::new();
@@ -902,10 +912,111 @@ impl RecursiveResolver {
                         DfsResult::Referral { ns_addrs, ns_names, zone, glue_records } => {
                             self.store_delegation(&zone, &ns_names, &ns_addrs, &glue_records);
                             for (name, ips) in &glue_records { curiosity.store_glue(name, ips); }
+
+                            // First try using glue addresses directly
                             if !ns_addrs.is_empty() && !got_referral {
                                 current_servers = self.select_servers_by_rtt(&ns_addrs, 4);
                                 if current_servers.is_empty() { current_servers = ns_addrs; }
                                 got_referral = true;
+                            }
+
+                            // If no glue addresses, try resolving NS names from caches
+                            if !got_referral {
+                                let mut resolved_addrs = Vec::new();
+
+                                for n in &ns_names {
+                                    let nl = n.to_lowercase();
+                                    if let Some(ips) = self.glue_cache.read().get(&nl) {
+                                        for ip in ips { resolved_addrs.push(SocketAddr::new(*ip, 53)); }
+                                    } else if let Some(ips) = curiosity.get_glue(n) {
+                                        for ip in &ips { resolved_addrs.push(SocketAddr::new(*ip, 53)); }
+                                    }
+                                }
+
+                                // If still empty, resolve NS names by querying from root
+                                // (non-recursive: query root/TLD for the NS name's A record)
+                                if resolved_addrs.is_empty() && depth < self.config.max_depth.saturating_sub(2) {
+                                    let ns_to_try: Vec<&String> = ns_names.iter().take(2).collect();
+                                    let pool = &self.socket_pool;
+                                    let ns_timeout = Duration::from_millis(self.config.query_timeout_ms);
+                                    for ns in &ns_to_try {
+                                        // Find closest delegation for this NS name and query it
+                                        let (ns_servers, _, _) = self.find_closest_delegation(ns);
+                                        let ns_selected = self.select_servers_by_rtt(&ns_servers, 3);
+                                        let try_list = if ns_selected.is_empty() {
+                                            ns_servers.iter().take(3).cloned().collect::<Vec<_>>()
+                                        } else { ns_selected };
+
+                                        for srv in &try_list {
+                                            if let Ok(resp) = Self::send_query_pooled(pool, ns, RecordType::A, *srv, ns_timeout).await {
+                                                let classified = Self::classify_response(&resp, ns);
+                                                match classified {
+                                                    DfsResult::Answer(data) => {
+                                                        if let Ok(parsed) = packet::parse_packet(&data) {
+                                                            for ans in &parsed.answers {
+                                                                if ans.rtype == RecordType::A && ans.rdata.len() == 4 {
+                                                                    let ip = IpAddr::V4(Ipv4Addr::new(
+                                                                        ans.rdata[0], ans.rdata[1], ans.rdata[2], ans.rdata[3],
+                                                                    ));
+                                                                    resolved_addrs.push(SocketAddr::new(ip, 53));
+                                                                    self.glue_cache.write().insert(ns.to_lowercase(), vec![ip]);
+                                                                    curiosity.store_glue(ns, &[ip]);
+                                                                }
+                                                            }
+                                                        }
+                                                        if !resolved_addrs.is_empty() { break; }
+                                                    }
+                                                    DfsResult::Referral { ns_addrs: ref_addrs, ns_names: ref_ns, zone: ref_zone, glue_records: ref_glue } => {
+                                                        self.store_delegation(&ref_zone, &ref_ns, &ref_addrs, &ref_glue);
+                                                        for (gn, gips) in &ref_glue { curiosity.store_glue(gn, gips); }
+                                                        // Follow one level of referral for NS resolution
+                                                        let follow_servers = if !ref_addrs.is_empty() {
+                                                            ref_addrs.clone()
+                                                        } else {
+                                                            // Try glue from the referral
+                                                            let mut gs = Vec::new();
+                                                            for rn in &ref_ns {
+                                                                if let Some(ips) = self.glue_cache.read().get(&rn.to_lowercase()) {
+                                                                    for ip in ips { gs.push(SocketAddr::new(*ip, 53)); }
+                                                                } else if let Some(ips) = curiosity.get_glue(rn) {
+                                                                    for ip in &ips { gs.push(SocketAddr::new(*ip, 53)); }
+                                                                }
+                                                            }
+                                                            gs
+                                                        };
+                                                        for fsrv in follow_servers.iter().take(2) {
+                                                            if let Ok(resp2) = Self::send_query_pooled(pool, ns, RecordType::A, *fsrv, ns_timeout).await {
+                                                                if let DfsResult::Answer(data2) = Self::classify_response(&resp2, ns) {
+                                                                    if let Ok(parsed2) = packet::parse_packet(&data2) {
+                                                                        for ans in &parsed2.answers {
+                                                                            if ans.rtype == RecordType::A && ans.rdata.len() == 4 {
+                                                                                let ip = IpAddr::V4(Ipv4Addr::new(
+                                                                                    ans.rdata[0], ans.rdata[1], ans.rdata[2], ans.rdata[3],
+                                                                                ));
+                                                                                resolved_addrs.push(SocketAddr::new(ip, 53));
+                                                                                self.glue_cache.write().insert(ns.to_lowercase(), vec![ip]);
+                                                                                curiosity.store_glue(ns, &[ip]);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !resolved_addrs.is_empty() { break; }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            if !resolved_addrs.is_empty() { break; }
+                                        }
+                                    }
+                                }
+
+                                if !resolved_addrs.is_empty() {
+                                    current_servers = self.select_servers_by_rtt(&resolved_addrs, 4);
+                                    if current_servers.is_empty() { current_servers = resolved_addrs; }
+                                    got_referral = true;
+                                }
                             }
                         }
                         _ => {}

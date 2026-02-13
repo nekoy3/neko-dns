@@ -423,15 +423,27 @@ pub fn append_feature_record(response: &mut Vec<u8>, neko: &NekoComment, feature
     if response.len() < 12 {
         return;
     }
+    let mut added: u16 = 0;
+
+    // 1. Feature flags TXT record
     if let Some(txt_record) = neko.build_feature_txt(features) {
+        response.extend_from_slice(&txt_record);
+        added += 1;
+    }
+
+    // 2. Random cat message TXT record
+    if let Some(msg_record) = neko.build_neko_message_txt() {
+        response.extend_from_slice(&msg_record);
+        added += 1;
+    }
+
+    if added > 0 {
         // Increment ARCOUNT (bytes 10-11)
         let arcount = u16::from_be_bytes([response[10], response[11]]);
-        let new_arcount = arcount.wrapping_add(1);
+        let new_arcount = arcount.wrapping_add(added);
         let ar_bytes = new_arcount.to_be_bytes();
         response[10] = ar_bytes[0];
         response[11] = ar_bytes[1];
-        // Append the TXT record
-        response.extend_from_slice(&txt_record);
     }
 }
 

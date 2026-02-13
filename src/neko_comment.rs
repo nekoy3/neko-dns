@@ -1,9 +1,34 @@
 use crate::config::NekoCommentConfig;
+use rand::seq::SliceRandom;
 
-/// 🐱 neko-dns feature notifier
-/// Adds an ADDITIONAL TXT record showing which resolver features
-/// were triggered during query processing.
+/// 🐱 neko-dns feature notifier + random cat messages
+/// Adds ADDITIONAL TXT records showing:
+/// 1. Which resolver features were triggered during query processing
+/// 2. A random cat message (neko-dns personality)
 /// All messages are pure ASCII to avoid encoding issues in dig/drill output.
+
+const NEKO_MESSAGES: &[&str] = &[
+    "=^.^= resolved with purrfection!",
+    "nyaa~ cache is warm and cozy",
+    "meow! another query served~",
+    "*stretches* ...oh, you needed DNS?",
+    "nyan~ faster than a cat chasing a laser",
+    "zzZ... *wakes up* here's your answer!",
+    "*purr* this one was easy~",
+    "fish? no, just DNS packets today",
+    "=^_^= happy to help, human!",
+    "*knocks query off the table* ...oops, here it is",
+    "tail up! your DNS is ready~",
+    "nyaa~ I found it in the root servers!",
+    "*bats at packets* got one for you!",
+    "the internet cat routes your queries~",
+    "meow meow! TTL is still fresh~",
+    "=^..^= neko-dns: powered by curiosity",
+    "*licks paw* another successful lookup",
+    "nya! recursive resolution complete~",
+    "catching DNS like catching mice~",
+    "*headbonk* here's your A record!",
+];
 
 pub struct NekoComment {
     enabled: bool,
@@ -113,6 +138,50 @@ impl NekoComment {
         // RDATA: TXT format = length-prefixed character-strings (max 255 each)
         let mut rdata = Vec::new();
         for chunk in summary_bytes.chunks(255) {
+            rdata.push(chunk.len() as u8);
+            rdata.extend_from_slice(chunk);
+        }
+
+        // RDLENGTH
+        record.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        record.extend(rdata);
+
+        Some(record)
+    }
+
+    /// Build an ADDITIONAL TXT record with a random cat message.
+    /// name: "neko-dns.comment." TXT record, class IN, TTL 0
+    pub fn build_neko_message_txt(&self) -> Option<Vec<u8>> {
+        if !self.enabled {
+            return None;
+        }
+
+        let msg = {
+            let mut rng = rand::thread_rng();
+            NEKO_MESSAGES.choose(&mut rng).unwrap_or(&"=^.^= meow!")
+        };
+
+        let msg_bytes = msg.as_bytes();
+
+        let mut record = Vec::new();
+
+        // Name: "neko-dns.comment." encoded as DNS labels
+        record.push(8);
+        record.extend_from_slice(b"neko-dns");
+        record.push(7);
+        record.extend_from_slice(b"comment");
+        record.push(0); // root label
+
+        // Type: TXT (16)
+        record.extend_from_slice(&16u16.to_be_bytes());
+        // Class: IN (1)
+        record.extend_from_slice(&1u16.to_be_bytes());
+        // TTL: 0 (do not cache)
+        record.extend_from_slice(&0u32.to_be_bytes());
+
+        // RDATA: TXT format
+        let mut rdata = Vec::new();
+        for chunk in msg_bytes.chunks(255) {
             rdata.push(chunk.len() as u8);
             rdata.extend_from_slice(chunk);
         }

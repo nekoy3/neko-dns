@@ -4,3 +4,4 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+tests/capture_dns.sh
