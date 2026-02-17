@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
+use std::time::Duration;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, debug, warn};
 
@@ -17,6 +18,7 @@ use crate::neko_comment::{NekoComment, QueryFeatures};
 use crate::recursive::RecursiveResolver;
 use crate::journey::JourneyTracker;
 use crate::curiosity::CuriosityCache;
+use crate::metrics::MetricsCounters;
 
 /// Core query engine - handles all DNS query processing
 pub struct QueryEngine {
@@ -31,6 +33,7 @@ pub struct QueryEngine {
     pub recursive: Option<Arc<RecursiveResolver>>,
     pub journey: Arc<JourneyTracker>,
     pub curiosity: Arc<CuriosityCache>,
+    pub metrics: Arc<MetricsCounters>,
 }
 
 impl QueryEngine {
@@ -63,6 +66,15 @@ impl QueryEngine {
         let journey = Arc::new(JourneyTracker::new(config.recursive.journey_txt));
         let curiosity = Arc::new(CuriosityCache::new(config.recursive.glue_ttl_secs));
 
+        // ローカルゾーン情報をログ出力
+        if !config.local_zones.is_empty() {
+            for zone in &config.local_zones {
+                info!("🏠 Local zone: *.{} -> {}:{}", zone.domain, zone.server, zone.port);
+            }
+        }
+
+        let metrics = Arc::new(MetricsCounters::new());
+
         Ok(Self {
             config,
             cache,
@@ -75,6 +87,7 @@ impl QueryEngine {
             recursive,
             journey,
             curiosity,
+            metrics,
         })
     }
 
@@ -87,10 +100,15 @@ impl QueryEngine {
         let (qname, qtype) = packet::extract_query_info(query_data)?;
         debug!("Query: {} {}", qname, qtype.name());
 
+        // 📊 Metrics: count query
+        self.metrics.queries_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.inc_query_type(&qtype.name());
+
         // Check chaos mode - maybe inject a failure
         if self.chaos.should_fail(&qname) {
             info!("🎲 Chaos mode: injecting SERVFAIL for {}", qname);
             features.chaos_triggered = true;
+            self.metrics.servfail_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.journal.record_query(&qname, &qtype, "CHAOS_SERVFAIL", 0, start.elapsed()).await;
             let mut response = packet::build_servfail(query_data)?;
             features.latency_ms = Some(start.elapsed().as_millis() as u64);
@@ -109,6 +127,9 @@ impl QueryEngine {
         if let Some(neg_response) = self.negative.check(&qname, &qtype) {
             debug!("Negative cache hit: {} {}", qname, qtype.name());
             features.negative_cache_hit = true;
+            self.metrics.negative_cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.nxdomain_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             features.latency_ms = Some(start.elapsed().as_millis() as u64);
             let mut response = neg_response;
             packet::append_feature_record(&mut response, &self.neko_comment, &features);
@@ -121,6 +142,8 @@ impl QueryEngine {
             debug!("Cache hit: {} {} (remaining TTL: {}s)", qname, qtype.name(), cached.remaining_ttl);
             features.cache_hit = true;
             features.ttl_alchemy = true;
+            self.metrics.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.noerror_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             features.latency_ms = Some(start.elapsed().as_millis() as u64);
             let mut response = packet::build_response(query_data, &cached.raw_response, cached.remaining_ttl)?;
             // 🐱 Feature notification
@@ -133,19 +156,35 @@ impl QueryEngine {
             return Ok(response);
         }
 
-        // Cache miss - try recursive resolution first, then fall back to upstream forwarding
+        // Cache miss - try local zone forwarding, recursive resolution, or upstream forwarding
         debug!("Cache miss: {} {} - resolving", qname, qtype.name());
         features.cache_miss = true;
+        self.metrics.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 🏠 Check local zones first
+        let local_zone_result = self.try_local_zone_forward(query_data, &qname).await;
 
         let (result_response, result_upstream_name, result_latency, result_original_ttl) = 
-            if let Some(ref recursive) = self.recursive {
+            if let Some((response, latency)) = local_zone_result {
+                // ローカルドメイン転送成功
+                features.local_zone = true;
+                self.metrics.local_zone_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let ttl = packet::parse_packet(&response)
+                    .ok()
+                    .and_then(|p| p.answers.first().map(|a| a.ttl))
+                    .unwrap_or(0);
+                (response, "local-zone".to_string(), latency, ttl)
+            } else if let Some(ref recursive) = self.recursive {
                 // 🌲 再帰解決モード
                 features.recursive = true;
                 features.parallel_dfs = true;
+                self.metrics.recursive_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let start_resolve = std::time::Instant::now();
                 match recursive.resolve(&qname, qtype, &self.curiosity, &self.journey).await {
                     Ok(mut response) => {
                         let latency = start_resolve.elapsed();
+                        self.metrics.recursive_successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.metrics.record_recursive_latency(latency.as_micros() as u64);
                         let ttl = packet::parse_packet(&response)
                             .ok()
                             .and_then(|p| p.answers.first().map(|a| a.ttl))
@@ -162,9 +201,11 @@ impl QueryEngine {
                     }
                     Err(e) => {
                         warn!("🌲 Recursive resolution failed for {} {}: {}, falling back to upstream", qname, qtype.name(), e);
+                        self.metrics.recursive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // フォールバック: upstream forwarding
                         features.recursive = false;
                         features.upstream_forward = true;
+                        self.metrics.upstream_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let result = self.upstream.race_query(query_data).await?;
                         features.upstream_winner = Some(result.upstream_name.clone());
                         (result.response, result.upstream_name, result.latency, result.original_ttl)
@@ -173,6 +214,7 @@ impl QueryEngine {
             } else {
                 // 📡 フォワーディングモード
                 features.upstream_forward = true;
+                self.metrics.upstream_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let result = self.upstream.race_query(query_data).await?;
                 features.upstream_winner = Some(result.upstream_name.clone());
                 (result.response, result.upstream_name, result.latency, result.original_ttl)
@@ -184,12 +226,16 @@ impl QueryEngine {
         // Check if NXDOMAIN - add to negative cache
         if response_packet.header.rcode == crate::dns::types::ResponseCode::NxDomain {
             self.negative.insert(&qname, &qtype, &result_response);
+            self.metrics.nxdomain_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!("Cached negative response for {} {}", qname, qtype.name());
         }
 
         // Cache the response (TTL alchemy will be applied internally)
         if response_packet.header.rcode == crate::dns::types::ResponseCode::NoError {
+            self.metrics.noerror_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.cache.insert(&qname, &qtype, &result_response, &result_upstream_name).await;
+        } else if response_packet.header.rcode == crate::dns::types::ResponseCode::ServFail {
+            self.metrics.servfail_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Record in journal
@@ -237,6 +283,7 @@ impl QueryEngine {
     /// Handle TCP DNS queries (length-prefixed)
     pub async fn handle_tcp(&self, mut stream: TcpStream, addr: SocketAddr) -> anyhow::Result<()> {
         debug!("TCP connection from {}", addr);
+        self.metrics.tcp_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         loop {
             // Read 2-byte length prefix
@@ -329,6 +376,13 @@ impl QueryEngine {
             stats["mode"] = serde_json::json!("forwarding");
         }
 
+        if !self.config.local_zones.is_empty() {
+            let zones: Vec<serde_json::Value> = self.config.local_zones.iter().map(|z| {
+                serde_json::json!({ "domain": z.domain, "server": format!("{}:{}", z.server, z.port) })
+            }).collect();
+            stats["local_zones"] = serde_json::json!(zones);
+        }
+
         stats
     }
 
@@ -356,6 +410,66 @@ impl QueryEngine {
             // 定期クリーンアップ
             self.curiosity.cleanup();
         }
+    }
+
+    /// 🏠 ローカルゾーン転送: ドメインがローカルゾーンにマッチする場合、指定サーバーに転送
+    async fn try_local_zone_forward(&self, query_data: &[u8], qname: &str) -> Option<(Vec<u8>, Duration)> {
+        let qname_lower = qname.to_lowercase();
+
+        for zone in &self.config.local_zones {
+            let domain_suffix = zone.domain.to_lowercase();
+            // "mynk.home" matches "foo.mynk.home" and "mynk.home" itself
+            if qname_lower == domain_suffix || qname_lower.ends_with(&format!(".{}", domain_suffix)) {
+                debug!("🏠 Local zone match: {} -> {}:{}", qname, zone.server, zone.port);
+
+                let addr: SocketAddr = match format!("{}:{}", zone.server, zone.port).parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("🏠 Invalid local zone server address {}:{}: {}", zone.server, zone.port, e);
+                        return None;
+                    }
+                };
+
+                let timeout = Duration::from_millis(zone.timeout_ms);
+                let start = std::time::Instant::now();
+
+                match Self::query_local_zone(query_data, addr, timeout).await {
+                    Ok(mut response) => {
+                        let latency = start.elapsed();
+                        // 元クエリのトランザクションIDをコピー
+                        if response.len() >= 2 && query_data.len() >= 2 {
+                            response[0] = query_data[0];
+                            response[1] = query_data[1];
+                        }
+                        // RA=1 (Recursion Available) を設定
+                        if response.len() >= 4 {
+                            response[3] |= 0x80;
+                        }
+                        info!("🏠 Local zone {} -> {}:{} ({:.1}ms)", qname, zone.server, zone.port, latency.as_millis());
+                        return Some((response, latency));
+                    }
+                    Err(e) => {
+                        warn!("🏠 Local zone query failed for {} -> {}:{}: {}", qname, zone.server, zone.port, e);
+                        return None;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// ローカルゾーンサーバーへの単純UDP転送
+    async fn query_local_zone(query: &[u8], addr: SocketAddr, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.send_to(query, addr).await?;
+
+        let mut buf = vec![0u8; 4096];
+        let len = tokio::time::timeout(timeout, socket.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Timeout querying local zone {}", addr))??;
+
+        Ok(buf[..len].to_vec())
     }
 
     /// ジャーニー履歴取得 (API用)

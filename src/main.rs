@@ -14,6 +14,7 @@ mod neko_comment;
 mod recursive;
 mod journey;
 mod curiosity;
+mod metrics;
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;

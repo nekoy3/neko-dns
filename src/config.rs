@@ -18,6 +18,8 @@ pub struct Config {
     pub neko_comment: NekoCommentConfig,
     #[serde(default)]
     pub recursive: RecursiveConfig,
+    #[serde(default)]
+    pub local_zones: Vec<LocalZoneConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -155,6 +157,20 @@ impl Default for NekoCommentConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct LocalZoneConfig {
+    /// ドメインサフィックス (e.g. "mynk.home")
+    pub domain: String,
+    /// 転送先DNSサーバーアドレス
+    pub server: String,
+    /// 転送先ポート
+    #[serde(default = "default_dns_port")]
+    pub port: u16,
+    /// タイムアウト (ms)
+    #[serde(default = "default_local_timeout")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct RecursiveConfig {
     /// 再帰解決を有効にする (falseならupstreamフォワードのみ)
     #[serde(default)]
@@ -217,6 +233,8 @@ fn default_neg_ttl() -> u32 { 300 }
 fn default_edns_code() -> u16 { 65001 }
 fn default_web_address() -> String { "0.0.0.0".to_string() }
 fn default_web_port() -> u16 { 8053 }
+fn default_dns_port() -> u16 { 53 }
+fn default_local_timeout() -> u64 { 1000 }
 fn default_root_hints_path() -> String { "root.hints".to_string() }
 fn default_max_depth() -> u32 { 20 }
 fn default_parallel_branches() -> u32 { 3 }

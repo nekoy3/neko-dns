@@ -2,14 +2,16 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Query, State},
-    response::{Html, Json},
+    response::{Html, Json, IntoResponse},
     routing::get,
+    http::{header, StatusCode},
 };
 use serde::Deserialize;
 use tracing::info;
 
 use crate::config::Config;
 use crate::dns::engine::QueryEngine;
+use crate::metrics;
 
 /// Web UI server - DNS ウェザーマップ
 /// リアルタイムにクエリフロー、キャッシュヒット率、upstreamレイテンシを表示
@@ -52,6 +54,7 @@ impl WebServer {
             .route("/api/journal", get(api_journal))
             .route("/api/upstreams", get(api_upstreams))
             .route("/api/journey", get(api_journey))
+            .route("/metrics", get(prometheus_metrics))
             .with_state(state);
 
         let addr = format!("{}:{}", self.config.web.address, self.config.web.port);
@@ -116,4 +119,14 @@ async fn api_journey(
         "stats": state.engine.journey.get_stats(),
         "curiosity": state.engine.curiosity.get_stats(),
     }))
+}
+
+/// Prometheus metrics endpoint - /metrics
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = metrics::render_metrics(&state.engine);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }

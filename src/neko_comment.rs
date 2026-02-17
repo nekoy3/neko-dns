@@ -50,6 +50,8 @@ pub struct QueryFeatures {
     pub parallel_dfs: bool,
     pub edns_detected: bool,
     pub chaos_triggered: bool,
+    /// Local zone forwarding was used
+    pub local_zone: bool,
     /// Which upstream won the race (if forwarding mode)
     pub upstream_winner: Option<String>,
     /// Resolution latency in ms
@@ -77,6 +79,7 @@ impl QueryFeatures {
         if self.journey_recorded { tags.push("JOURNEY"); }
         if self.edns_detected  { tags.push("EDNS"); }
         if self.chaos_triggered { tags.push("CHAOS"); }
+        if self.local_zone     { tags.push("LOCAL_ZONE"); }
 
         let features = tags.join("|");
         let mut parts = vec![format!("neko-dns [{}]", features)];
